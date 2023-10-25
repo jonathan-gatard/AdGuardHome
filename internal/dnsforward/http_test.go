@@ -547,7 +547,7 @@ func TestServer_HandleTestUpstreamDNS(t *testing.T) {
 			"upstream_dns": []string{"[/domain.example/]" + badUps},
 		},
 		wantResp: map[string]any{
-			"[/domain.example/]" + badUps: `WARNING: couldn't communicate ` +
+			badUps: `WARNING: couldn't communicate ` +
 				`with upstream: exchanging with ` + badUps + ` over tcp: ` +
 				`dns: id mismatch`,
 		},

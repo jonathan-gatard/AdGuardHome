@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
@@ -445,7 +446,7 @@ func newUpstreamConfig(upstreams []string) (conf *proxy.UpstreamConfig, err erro
 	}
 
 	for _, u := range upstreams {
-		var ups string
+		var ups []string
 		var domains []string
 		ups, domains, err = separateUpstream(u)
 		if err != nil {
@@ -453,9 +454,11 @@ func newUpstreamConfig(upstreams []string) (conf *proxy.UpstreamConfig, err erro
 			return nil, err
 		}
 
-		_, err = validateUpstream(ups, domains)
-		if err != nil {
-			return nil, fmt.Errorf("validating upstream %q: %w", u, err)
+		for _, addr := range ups {
+			_, err = validateUpstream(addr, domains)
+			if err != nil {
+				return nil, fmt.Errorf("validating upstream %q: %w", addr, err)
+			}
 		}
 	}
 
@@ -567,12 +570,12 @@ func validateUpstream(u string, domains []string) (useDefault bool, err error) {
 	return false, err
 }
 
-// separateUpstream returns the upstream and the specified domains.  domains is
-// nil when the upstream is not domains-specific.  Otherwise it may also be
+// separateUpstream returns the upstreams and the specified domains.  domains
+// is nil when the upstream is not domains-specific.  Otherwise it may also be
 // empty.
-func separateUpstream(upstreamStr string) (ups string, domains []string, err error) {
+func separateUpstream(upstreamStr string) (upstreams, domains []string, err error) {
 	if !strings.HasPrefix(upstreamStr, "[/") {
-		return upstreamStr, nil, nil
+		return []string{upstreamStr}, nil, nil
 	}
 
 	defer func() { err = errors.Annotate(err, "bad upstream for domain %q: %w", upstreamStr) }()
@@ -582,9 +585,9 @@ func separateUpstream(upstreamStr string) (ups string, domains []string, err err
 	case 2:
 		// Go on.
 	case 1:
-		return "", nil, errors.Error("missing separator")
+		return nil, nil, errors.Error("missing separator")
 	default:
-		return "", []string{}, errors.Error("duplicated separator")
+		return nil, nil, errors.Error("duplicated separator")
 	}
 
 	for i, host := range strings.Split(parts[0], "/") {
@@ -594,13 +597,13 @@ func separateUpstream(upstreamStr string) (ups string, domains []string, err err
 
 		err = netutil.ValidateDomainName(strings.TrimPrefix(host, "*."))
 		if err != nil {
-			return "", domains, fmt.Errorf("domain at index %d: %w", i, err)
+			return nil, nil, fmt.Errorf("domain at index %d: %w", i, err)
 		}
 
 		domains = append(domains, host)
 	}
 
-	return parts[1], domains, nil
+	return strings.Fields(parts[1]), domains, nil
 }
 
 // healthCheckFunc is a signature of function to check if upstream exchanges
@@ -683,31 +686,14 @@ func (err domainSpecificTestError) Error() (msg string) {
 	return fmt.Sprintf("WARNING: %s", err.error)
 }
 
-// parseUpstreamLine parses line and creates the [upstream.Upstream] using opts
-// and information from [s.dnsFilter.EtcHosts].  It returns an error if the line
-// is not a valid upstream line, see [upstream.AddressToUpstream].  It's a
-// caller's responsibility to close u.
-func (s *Server) parseUpstreamLine(
-	line string,
+// upstreamFromAddr creates the [upstream.Upstream] using opts and information
+// from [s.dnsFilter.EtcHosts].  It returns an error if the line is not a valid
+// upstream line, see [upstream.AddressToUpstream].  It's a caller's
+// responsibility to close u.
+func (s *Server) upstreamFromAddr(
+	addr string,
 	opts *upstream.Options,
-) (u upstream.Upstream, specific bool, err error) {
-	// Separate upstream from domains list.
-	upstreamAddr, domains, err := separateUpstream(line)
-	if err != nil {
-		return nil, false, fmt.Errorf("wrong upstream format: %w", err)
-	}
-
-	specific = len(domains) > 0
-
-	useDefault, err := validateUpstream(upstreamAddr, domains)
-	if err != nil {
-		return nil, specific, fmt.Errorf("wrong upstream format: %w", err)
-	} else if useDefault {
-		return nil, specific, nil
-	}
-
-	log.Debug("dnsforward: checking if upstream %q works", upstreamAddr)
-
+) (u upstream.Upstream, err error) {
 	opts = &upstream.Options{
 		Bootstrap:  opts.Bootstrap,
 		Timeout:    opts.Timeout,
@@ -716,34 +702,73 @@ func (s *Server) parseUpstreamLine(
 
 	// dnsFilter can be nil during application update.
 	if s.dnsFilter != nil {
-		recs := s.dnsFilter.EtcHostsRecords(extractUpstreamHost(upstreamAddr))
+		recs := s.dnsFilter.EtcHostsRecords(extractUpstreamHost(addr))
 		for _, rec := range recs {
 			opts.ServerIPAddrs = append(opts.ServerIPAddrs, rec.Addr.AsSlice())
 		}
 		sortNetIPAddrs(opts.ServerIPAddrs, opts.PreferIPv6)
 	}
-	u, err = upstream.AddressToUpstream(upstreamAddr, opts)
+	u, err = upstream.AddressToUpstream(addr, opts)
 	if err != nil {
-		return nil, specific, fmt.Errorf("creating upstream for %q: %w", upstreamAddr, err)
+		return nil, fmt.Errorf("creating upstream for %q: %w", addr, err)
 	}
 
-	return u, specific, nil
+	return u, nil
 }
 
-func (s *Server) checkDNS(line string, opts *upstream.Options, check healthCheckFunc) (err error) {
-	if IsCommentOrEmpty(line) {
+func (s *Server) checkDNS(
+	line string,
+	opts *upstream.Options,
+	check healthCheckFunc,
+) (result map[string]string) {
+	result = map[string]string{}
+	upstreams, domains, err := separateUpstream(line)
+	if err != nil {
 		return nil
 	}
 
-	var u upstream.Upstream
-	var specific bool
+	specific := len(domains) > 0
+
+	for _, upstreamAddr := range upstreams {
+		var useDefault bool
+		useDefault, err = validateUpstream(upstreamAddr, domains)
+		if err != nil {
+			err = fmt.Errorf("wrong upstream format: %w", err)
+			result[upstreamAddr] = err.Error()
+
+			continue
+		} else if useDefault {
+			continue
+		}
+
+		log.Debug("dnsforward: checking if upstream %q works", upstreamAddr)
+
+		err = s.checkUpstreamAddr(upstreamAddr, specific, opts, check)
+		if err != nil {
+			result[upstreamAddr] = err.Error()
+		} else {
+			result[upstreamAddr] = "OK"
+		}
+	}
+
+	return result
+}
+
+func (s *Server) checkUpstreamAddr(
+	upstreamAddr string,
+	specific bool,
+	opts *upstream.Options,
+	check healthCheckFunc,
+) (err error) {
 	defer func() {
 		if err != nil && specific {
 			err = domainSpecificTestError{error: err}
 		}
 	}()
 
-	u, specific, err = s.parseUpstreamLine(line, opts)
+	var u upstream.Upstream
+	u, err = s.upstreamFromAddr(upstreamAddr, opts)
+
 	if err != nil || u == nil {
 		return err
 	}
@@ -761,6 +786,15 @@ func (s *Server) handleTestUpstreamDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.Upstreams = stringutil.FilterOut(req.Upstreams, IsCommentOrEmpty)
+	req.FallbackDNS = stringutil.FilterOut(req.FallbackDNS, IsCommentOrEmpty)
+	req.PrivateUpstreams = stringutil.FilterOut(req.PrivateUpstreams, IsCommentOrEmpty)
+
+	result := s.checkUpstreamRequest(req)
+	aghhttp.WriteJSONResponseOK(w, r, result)
+}
+
+func (s *Server) checkUpstreamRequest(req *upstreamJSON) (result map[string]string) {
 	opts := &upstream.Options{
 		Bootstrap:  req.BootstrapDNS,
 		Timeout:    s.conf.UpstreamTimeout,
@@ -770,56 +804,52 @@ func (s *Server) handleTestUpstreamDNS(w http.ResponseWriter, r *http.Request) {
 		opts.Bootstrap = defaultBootstrap
 	}
 
-	type upsCheckResult = struct {
-		err  error
-		host string
+	var wg sync.WaitGroup
+	var m sync.Map
+
+	store := func(result map[string]string) {
+		for u, e := range result {
+			m.Store(u, e)
+		}
 	}
 
-	req.Upstreams = stringutil.FilterOut(req.Upstreams, IsCommentOrEmpty)
-	req.FallbackDNS = stringutil.FilterOut(req.FallbackDNS, IsCommentOrEmpty)
-	req.PrivateUpstreams = stringutil.FilterOut(req.PrivateUpstreams, IsCommentOrEmpty)
-
-	upsNum := len(req.Upstreams) + len(req.FallbackDNS) + len(req.PrivateUpstreams)
-	result := make(map[string]string, upsNum)
-	resCh := make(chan upsCheckResult, upsNum)
+	wg.Add(len(req.Upstreams) + len(req.FallbackDNS) + len(req.PrivateUpstreams))
 
 	for _, ups := range req.Upstreams {
 		go func(ups string) {
-			resCh <- upsCheckResult{
-				host: ups,
-				err:  s.checkDNS(ups, opts, checkDNSUpstreamExc),
-			}
+			res := s.checkDNS(ups, opts, checkDNSUpstreamExc)
+			store(res)
+			wg.Done()
 		}(ups)
 	}
 	for _, ups := range req.FallbackDNS {
 		go func(ups string) {
-			resCh <- upsCheckResult{
-				host: ups,
-				err:  s.checkDNS(ups, opts, checkDNSUpstreamExc),
-			}
+			res := s.checkDNS(ups, opts, checkDNSUpstreamExc)
+			store(res)
+			wg.Done()
 		}(ups)
 	}
 	for _, ups := range req.PrivateUpstreams {
 		go func(ups string) {
-			resCh <- upsCheckResult{
-				host: ups,
-				err:  s.checkDNS(ups, opts, checkPrivateUpstreamExc),
-			}
+			res := s.checkDNS(ups, opts, checkPrivateUpstreamExc)
+			store(res)
+			wg.Done()
 		}(ups)
 	}
 
-	for i := 0; i < upsNum; i++ {
-		// TODO(e.burkov):  The upstreams used for both common and private
-		// resolving should be reported separately.
-		pair := <-resCh
-		if pair.err != nil {
-			result[pair.host] = pair.err.Error()
-		} else {
-			result[pair.host] = "OK"
-		}
-	}
+	wg.Wait()
 
-	aghhttp.WriteJSONResponseOK(w, r, result)
+	result = map[string]string{}
+	m.Range(func(k, v any) bool {
+		u := k.(string)
+		e := v.(string)
+
+		result[u] = e
+
+		return true
+	})
+
+	return result
 }
 
 // handleCacheClear is the handler for the POST /control/cache_clear HTTP API.
