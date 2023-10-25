@@ -130,10 +130,12 @@ func TestDNSForwardHTTP_handleGetConfig(t *testing.T) {
 }
 
 func TestDNSForwardHTTP_handleSetConfig(t *testing.T) {
+	const defaultBlockedResponseTTL = 10
+
 	filterConf := &filtering.Config{
 		ProtectionEnabled:     true,
 		BlockingMode:          filtering.BlockingModeDefault,
-		BlockedResponseTTL:    10,
+		BlockedResponseTTL:    defaultBlockedResponseTTL,
 		SafeBrowsingEnabled:   true,
 		SafeBrowsingCacheSize: 1000,
 		SafeSearchConf:        filtering.SafeSearchConfig{Enabled: true},
@@ -229,6 +231,9 @@ func TestDNSForwardHTTP_handleSetConfig(t *testing.T) {
 	}, {
 		name:    "blocked_response_ttl",
 		wantSet: "",
+	}, {
+		name:    "multiple_domain_specific_upstreams",
+		wantSet: "",
 	}}
 
 	var data map[string]struct {
@@ -250,6 +255,7 @@ func TestDNSForwardHTTP_handleSetConfig(t *testing.T) {
 				s.dnsFilter.SetBlockingMode(filtering.BlockingModeDefault, netip.Addr{}, netip.Addr{})
 				s.conf = defaultConf
 				s.conf.Config.EDNSClientSubnet = &EDNSClientSubnet{}
+				s.dnsFilter.SetBlockedResponseTTL(defaultBlockedResponseTTL)
 			})
 
 			rBody := io.NopCloser(bytes.NewReader(caseData.Req))
@@ -585,6 +591,17 @@ func TestServer_HandleTestUpstreamDNS(t *testing.T) {
 			goodUps: "OK",
 		},
 		name: "fallback_comment_mix",
+	}, {
+		body: map[string]any{
+			"upstream_dns": []string{"[/domain.example/]" + goodUps + " " + badUps},
+		},
+		wantResp: map[string]any{
+			goodUps: "OK",
+			badUps: `WARNING: couldn't communicate ` +
+				`with upstream: exchanging with ` + badUps + ` over tcp: ` +
+				`dns: id mismatch`,
+		},
+		name: "multiple_domain_specific_upstreams",
 	}}
 
 	for _, tc := range testCases {

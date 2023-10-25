@@ -716,6 +716,10 @@ func (s *Server) upstreamFromAddr(
 	return u, nil
 }
 
+// checkDNS parses line, creates DNS upstreams using opts, and checks if the
+// upstreams are exchanging correctly.  It returns a map where key is an
+// upstream address and value is "OK", if the upstream exchanges correctly, or
+// text of the error.
 func (s *Server) checkDNS(
 	line string,
 	opts *upstream.Options,
@@ -737,7 +741,9 @@ func (s *Server) checkDNS(
 			result[upstreamAddr] = err.Error()
 
 			continue
-		} else if useDefault {
+		}
+
+		if useDefault {
 			continue
 		}
 
@@ -754,6 +760,10 @@ func (s *Server) checkDNS(
 	return result
 }
 
+// checkUpstreamAddr creates the DNS upstream using opts and upstreamAddr.
+// Checks if the DNS upstream echanges correctly.  It returns an error if
+// upstreamAddr is not valid DNS upstream address or the upstream is not
+// exchanging correctly.
 func (s *Server) checkUpstreamAddr(
 	upstreamAddr string,
 	specific bool,
@@ -766,9 +776,7 @@ func (s *Server) checkUpstreamAddr(
 		}
 	}()
 
-	var u upstream.Upstream
-	u, err = s.upstreamFromAddr(upstreamAddr, opts)
-
+	u, err := s.upstreamFromAddr(upstreamAddr, opts)
 	if err != nil || u == nil {
 		return err
 	}
@@ -777,6 +785,8 @@ func (s *Server) checkUpstreamAddr(
 	return check(u)
 }
 
+// handleTestUpstreamDNS handles requests to the POST /control/test_upstream_dns
+// endpoint.
 func (s *Server) handleTestUpstreamDNS(w http.ResponseWriter, r *http.Request) {
 	req := &upstreamJSON{}
 	err := json.NewDecoder(r.Body).Decode(req)
@@ -790,11 +800,6 @@ func (s *Server) handleTestUpstreamDNS(w http.ResponseWriter, r *http.Request) {
 	req.FallbackDNS = stringutil.FilterOut(req.FallbackDNS, IsCommentOrEmpty)
 	req.PrivateUpstreams = stringutil.FilterOut(req.PrivateUpstreams, IsCommentOrEmpty)
 
-	result := s.checkUpstreamRequest(req)
-	aghhttp.WriteJSONResponseOK(w, r, result)
-}
-
-func (s *Server) checkUpstreamRequest(req *upstreamJSON) (result map[string]string) {
 	opts := &upstream.Options{
 		Bootstrap:  req.BootstrapDNS,
 		Timeout:    s.conf.UpstreamTimeout,
@@ -807,39 +812,30 @@ func (s *Server) checkUpstreamRequest(req *upstreamJSON) (result map[string]stri
 	var wg sync.WaitGroup
 	var m sync.Map
 
-	store := func(result map[string]string) {
-		for u, e := range result {
+	worker := func(upstreamLine string, check healthCheckFunc) {
+		res := s.checkDNS(upstreamLine, opts, check)
+		for u, e := range res {
 			m.Store(u, e)
 		}
+
+		wg.Done()
 	}
 
 	wg.Add(len(req.Upstreams) + len(req.FallbackDNS) + len(req.PrivateUpstreams))
 
 	for _, ups := range req.Upstreams {
-		go func(ups string) {
-			res := s.checkDNS(ups, opts, checkDNSUpstreamExc)
-			store(res)
-			wg.Done()
-		}(ups)
+		go worker(ups, checkDNSUpstreamExc)
 	}
 	for _, ups := range req.FallbackDNS {
-		go func(ups string) {
-			res := s.checkDNS(ups, opts, checkDNSUpstreamExc)
-			store(res)
-			wg.Done()
-		}(ups)
+		go worker(ups, checkDNSUpstreamExc)
 	}
 	for _, ups := range req.PrivateUpstreams {
-		go func(ups string) {
-			res := s.checkDNS(ups, opts, checkPrivateUpstreamExc)
-			store(res)
-			wg.Done()
-		}(ups)
+		go worker(ups, checkPrivateUpstreamExc)
 	}
 
 	wg.Wait()
 
-	result = map[string]string{}
+	result := map[string]string{}
 	m.Range(func(k, v any) bool {
 		u := k.(string)
 		e := v.(string)
@@ -849,7 +845,7 @@ func (s *Server) checkUpstreamRequest(req *upstreamJSON) (result map[string]stri
 		return true
 	})
 
-	return result
+	aghhttp.WriteJSONResponseOK(w, r, result)
 }
 
 // handleCacheClear is the handler for the POST /control/cache_clear HTTP API.
