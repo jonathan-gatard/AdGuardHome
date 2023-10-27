@@ -501,7 +501,7 @@
     "rewrite_applied": "Règle de réécriture appliquée",
     "rewrite_hosts_applied": "Réécrit par la règle du fichier hosts",
     "dns_rewrites": "Réécritures DNS",
-    "form_domain": "Saisissez un domaine ou caracrtère générique",
+    "form_domain": "Saisissez un domaine ou caractère générique",
     "form_answer": "Saisissez une adresse IP ou un nom de domaine",
     "form_error_domain_format": "Format de domaine invalide",
     "form_error_answer_format": "Format de réponse invalide",
